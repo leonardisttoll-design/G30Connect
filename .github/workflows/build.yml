@@ -1,0 +1,33 @@
+name: iPhone-App bauen
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: XcodeGen installieren
+        run: brew install xcodegen
+      - name: Projekt erzeugen
+        run: xcodegen generate
+      - name: iPhone-App kompilieren
+        run: >-
+          xcodebuild -project G30Connect.xcodeproj -scheme G30Connect
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
+          -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: IPA fuer AltStore packen
+        run: |
+          mkdir -p package/Payload
+          cp -R build/Build/Products/Release-iphoneos/G30Connect.app package/Payload/
+          test -f package/Payload/G30Connect.app/G30Connect
+          cd package
+          zip -qr ../G30Connect.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: G30Connect-AltStore
+          path: G30Connect.ipa
+          if-no-files-found: error
+          retention-days: 3
