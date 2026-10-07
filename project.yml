@@ -1,0 +1,31 @@
+name: G30Connect
+options:
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    TARGETED_DEVICE_FAMILY: '1'
+    PRODUCT_BUNDLE_IDENTIFIER: com.example.g30connect
+    MARKETING_VERSION: '0.1.0'
+    CURRENT_PROJECT_VERSION: '1'
+targets:
+  G30Connect:
+    type: application
+    platform: iOS
+    sources: [Sources]
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: G30 Connect
+        NSBluetoothAlwaysUsageDescription: G30 Connect sucht deinen Scooter und untersucht seine Bluetooth-Dienste.
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        CODE_SIGNING_ALLOWED: NO
+schemes:
+  G30Connect:
+    build:
+      targets:
+        G30Connect: all
