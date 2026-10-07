@@ -36,6 +36,12 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     @Published var receiving = false
     @Published var packetCount = 0
     @Published var receiveStatus = "Empfang wird nach dem Verbinden verfügbar."
+    @Published var queryStatus = "Noch keine aktive Abfrage durchgeführt."
+    private var writeCharacteristic: CBCharacteristic?
+    private var queryPending = false
+    private var querySent = false
+    private var queryTimeout: DispatchWorkItem?
+    private var replyBuffer: [UInt8] = []
     private let uartService = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
     private let uartTX = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
     private var receiveCharacteristic: CBCharacteristic?
@@ -92,7 +98,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         log = []
         scanning = true
         status = "Suche läuft für 15 Sekunden …"
-        record("G30 Connect 0.2 · UART-Empfangstest ohne Scooter-Schreibbefehle")
+        record("G30 Connect 0.3 · Empfang und einzelne Legacy-Leseabfrage")
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
@@ -239,9 +245,20 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
             receiverReady = true
             receiveStatus = "Empfangsschnittstelle gefunden. Starte den 20-Sekunden-Test."
         }
+        if service.uuid == uartService {
+            writeCharacteristic = service.characteristics?.first {
+                $0.uuid == CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E") && $0.properties.contains(.write)
+            }
+        }
     }
 
     private func resetReceiver() {
+        queryTimeout?.cancel()
+        queryPending = false
+        querySent = false
+        writeCharacteristic = nil
+        replyBuffer = []
+        queryStatus = "Noch keine aktive Abfrage durchgeführt."
         receiveTimeout?.cancel()
         receiveCharacteristic = nil
         receiveStarted = nil
@@ -252,6 +269,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     func startReceiveTest() {
+        guard !queryPending else { return }
         guard connected, !receiving, let peripheral = selected,
               let characteristic = receiveCharacteristic else { return }
         receiveTimeout?.cancel()
@@ -267,6 +285,11 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     func stopReceiveTest() {
+        if queryPending {
+            queryTimeout?.cancel()
+            queryPending = false
+            queryStatus = "Leseabfrage beendet."
+        }
         receiveTimeout?.cancel()
         guard receiving else { return }
         receiving = false
@@ -282,6 +305,9 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard selected === peripheral, characteristic === receiveCharacteristic else { return }
         if let error = error {
+            queryTimeout?.cancel()
+            queryPending = false
+            queryStatus = "Empfangsaktivierung fehlgeschlagen. Keine Abfrage gesendet."
             receiveTimeout?.cancel()
             receiving = false
             receiveStatus = "Empfang konnte nicht aktiviert oder deaktiviert werden."
@@ -289,6 +315,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         } else if receiving && characteristic.isNotifying {
             receiveStatus = "Empfang aktiv · warte auf Daten vom Scooter …"
             record("UART-Benachrichtigungen bestätigt.")
+            if queryPending { sendVersionQuery() }
         } else if !receiving && characteristic.isNotifying {
             // Handle a late successful enable after the test was cancelled.
             peripheral.setNotifyValue(false, for: characteristic)
@@ -302,12 +329,95 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         packetCount += 1
         receiveStatus = "Empfang aktiv · \(packetCount) Datenpakete"
         let seconds = Date().timeIntervalSince(receiveStarted ?? Date())
+        if queryPending { parseQueryReply(data) }
         // Cap logging to avoid flooding the UI and bound each packet's export size.
         if packetCount <= 40 {
             let hex = data.prefix(128).map { String(format: "%02X", $0) }.joined(separator: " ")
             record(String(format: "RX +%.3fs", seconds) + " · \(data.count) Bytes: " + hex + (data.count > 128 ? " … (gekürzt)" : ""))
         } else if packetCount == 41 {
             record("Weitere Pakete werden nur gezählt; die ersten 40 sind im Bericht.")
+        }
+    }
+
+    var canQuery: Bool { connected && receiverReady && writeCharacteristic != nil && !receiving && !queryPending }
+
+    func startVersionQuery() {
+        guard canQuery, let peripheral = selected, let tx = receiveCharacteristic else { return }
+        queryPending = true
+        querySent = false
+        replyBuffer = []
+        receiving = true
+        packetCount = 0
+        receiveStarted = Date()
+        queryStatus = "Aktiviere Empfang für eine einzelne Leseabfrage …"
+        receiveStatus = "Aktive Leseabfrage läuft …"
+        record("Legacy-Test: CMD 01 (Lesen), Controller 20, Register 1A, Länge 2. XiaoDash-Unterstützung ungeprüft.")
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self = self, self.queryPending else { return }
+            self.queryPending = false
+            self.queryStatus = self.querySent
+                ? "Keine passende Legacy-Antwort. Verschlüsselung, Authentifizierung oder anderes Protokoll möglich."
+                : "Empfang nicht rechtzeitig bestätigt; keine Anfrage gesendet."
+            self.record(self.queryStatus)
+            self.stopReceiveTest()
+        }
+        queryTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+        if tx.isNotifying { sendVersionQuery() }
+        else { peripheral.setNotifyValue(true, for: tx) }
+    }
+
+    private func sendVersionQuery() {
+        guard queryPending, !querySent, let peripheral = selected,
+              let rx = writeCharacteristic, receiveCharacteristic?.isNotifying == true else { return }
+        // Ninebot ES protocol: one read of the read-only firmware version register.
+        // Source 3E = phone, destination 20 = ESC, command 01 = read, payload 02 = two bytes.
+        // No retries, writes to configuration registers, or pairing changes.
+        let packet: [UInt8] = [0x5A, 0xA5, 0x01, 0x3E, 0x20, 0x01, 0x1A, 0x02, 0x83, 0xFF]
+        querySent = true
+        queryStatus = "Eine Versionsabfrage gesendet · warte auf Antwort …"
+        record("TX: 5A A5 01 3E 20 01 1A 02 83 FF (nur Versionsabfrage)")
+        peripheral.writeValue(Data(packet), for: rx, type: .withResponse)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard selected === peripheral, characteristic === writeCharacteristic, queryPending else { return }
+        if let error = error {
+            queryPending = false
+            queryTimeout?.cancel()
+            queryStatus = "Anfrage konnte nicht übertragen werden: \(error.localizedDescription)"
+            record(queryStatus)
+            stopReceiveTest()
+        } else {
+            record("Bluetooth bestätigt Übertragung. Dies bestätigt noch keine Protokoll-Antwort.")
+        }
+    }
+
+    private func parseQueryReply(_ data: Data) {
+        replyBuffer.append(contentsOf: data)
+        if replyBuffer.count > 1024 { replyBuffer = Array(replyBuffer.suffix(512)) }
+        while replyBuffer.count >= 3 {
+            guard replyBuffer[0] == 0x5A, replyBuffer[1] == 0xA5 else {
+                replyBuffer.removeFirst()
+                continue
+            }
+            let count = Int(replyBuffer[2]) + 9
+            guard replyBuffer.count >= count else { return }
+            let frame = Array(replyBuffer.prefix(count))
+            let sum = frame[2..<(count - 2)].reduce(UInt16(0)) { $0 &+ UInt16($1) }
+            let crc = UInt16(frame[count - 2]) | (UInt16(frame[count - 1]) << 8)
+            guard crc == ~sum else { replyBuffer.removeFirst(); continue }
+            replyBuffer.removeFirst(count)
+            guard querySent, frame[2] == 2, frame[3] == 0x20, frame[4] == 0x3E,
+                  frame[5] == 0x04, frame[6] == 0x1A else { continue }
+            let version = UInt16(frame[7]) | (UInt16(frame[8]) << 8)
+            queryPending = false
+            queryTimeout?.cancel()
+            queryStatus = String(format: "Gültige Legacy-Antwort · Versionsregister: 0x%04X.", version)
+            record(queryStatus)
+            record("Der Registerwert kann durch XiaoDash überschrieben sein; er identifiziert nicht zuverlässig die echte Firmware-Version.")
+            stopReceiveTest()
+            return
         }
     }
 
@@ -323,7 +433,7 @@ struct ContentView: View {
                     Label("G30 CONNECT", systemImage: "scooter")
                         .font(.title2.bold()).foregroundStyle(.mint)
                     Text("Dein Scooter. Deine Verbindung.").font(.headline)
-                    Text("Version 0.2 · Datenempfangstest").foregroundStyle(.secondary)
+                    Text("Version 0.3 · Protokolltest").foregroundStyle(.secondary)
                     Text(model.status).accessibilityIdentifier("connectionStatus")
                     if model.scanning || model.busy { ProgressView() }
                     Button(model.scanning ? "Erneut suchen" : "Scooter suchen") { model.scan() }
@@ -344,6 +454,13 @@ struct ContentView: View {
                             .disabled(!model.connected || !model.receiverReady)
                     }
                     Text("Empfangene Pakete: \(model.packetCount)").font(.caption)
+                }
+                Section("Aktive Versionsabfrage") {
+                    Text(model.queryStatus)
+                    Text("Sendet einmal den dokumentierten Ninebot-Lesebefehl für das Versionsregister. Ob deine XiaoDash-Firmware dieses ältere, unverschlüsselte Protokoll akzeptiert, ist noch offen. Test im Stand durchführen.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Versionsregister abfragen") { model.startVersionQuery() }
+                        .disabled(!model.canQuery)
                 }
                 Section("Bluetooth-Geräte") {
                     if model.devices.isEmpty {
