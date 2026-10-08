@@ -7,8 +7,8 @@ settings:
     SWIFT_VERSION: '5.0'
     TARGETED_DEVICE_FAMILY: '1'
     PRODUCT_BUNDLE_IDENTIFIER: com.example.g30connect
-    MARKETING_VERSION: '0.5.0'
-    CURRENT_PROJECT_VERSION: '5'
+    MARKETING_VERSION: '0.6.0'
+    CURRENT_PROJECT_VERSION: '6'
 targets:
   G30Connect:
     type: application
@@ -20,6 +20,7 @@ targets:
         CFBundleDisplayName: G30 Connect
         NSBluetoothAlwaysUsageDescription: G30 Connect sucht deinen Scooter und untersucht seine Bluetooth-Dienste.
         UILaunchScreen: {}
+        UIBackgroundModes: [bluetooth-central]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     settings:
       base:

@@ -102,7 +102,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         log = []
         scanning = true
         status = "Suche läuft für 15 Sekunden …"
-        record("G30 Connect 0.5 · Verschlüsselte Messwertabfragen")
+        record("G30 Connect 0.6 · Hintergrundverbindung und Einstellungs-Leseprüfung")
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
@@ -448,7 +448,6 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
 
 struct ContentView: View {
     @ObservedObject var model: BluetoothModel
-    @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         NavigationStack {
             List {
@@ -456,7 +455,7 @@ struct ContentView: View {
                     Label("G30 CONNECT", systemImage: "scooter")
                         .font(.title2.bold()).foregroundStyle(.mint)
                     Text("Dein Scooter. Deine Verbindung.").font(.headline)
-                    Text("Version 0.5 · Anmeldung und Messwerte").foregroundStyle(.secondary)
+                    Text("Version 0.6 · Verbindung und Einstellungen").foregroundStyle(.secondary)
                     Text(model.status).accessibilityIdentifier("connectionStatus")
                     if model.scanning || model.busy { ProgressView() }
                     Button(model.scanning ? "Erneut suchen" : "Scooter suchen") { model.scan() }
@@ -500,6 +499,22 @@ struct ContentView: View {
                             .disabled(!model.canQuery)
                     }
                 }
+                Section("Einstellungen prüfen") {
+                    Text(model.pairing.configurationStatus)
+                    Text("Liest elf dokumentierte Einstellungsregister aus den ES- und G30-Tabellen. Die Zuordnung zu XiaoDash wird anhand der Antworten geprüft; Fahrparameter werden noch nicht verändert.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    Button("Einstellungen auslesen") { model.pairing.inspectConfiguration() }
+                        .disabled(!model.pairing.authenticated || model.pairing.inspectingConfiguration)
+                    if model.pairing.inspectingConfiguration {
+                        ProgressView(value: Double(model.pairing.configurationCompleted), total: Double(PairingTest.configurationRegisters.count))
+                        Text("Bei fehlenden Antworten kann die Prüfung etwa eine Minute dauern.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(model.pairing.configurationValues.keys.sorted(), id: \.self) { register in
+                        Text(String(format: "Register 0x%02X: 0x%04X", register, model.pairing.configurationValues[register] ?? 0))
+                            .font(.caption.monospaced())
+                    }
+                }
                 Section("Bluetooth-Geräte") {
                     if model.devices.isEmpty {
                         Text("Schalte den Scooter ein und schließe XiaoDash auf dem anderen Handy. Tippe dann auf ‚Scooter suchen‘.")
@@ -540,11 +555,9 @@ struct ContentView: View {
             }
             .navigationTitle("G30 Connect")
             .preferredColorScheme(.dark)
-            .onChange(of: scenePhase) { phase in
-                if phase == .background { model.disconnect() }
-            }
         }
     }
 }
+
 
 

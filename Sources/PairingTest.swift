@@ -9,6 +9,15 @@ final class PairingTest: ObservableObject {
     @Published var authenticated = false
     @Published var readings: [UInt8: TelemetryReading] = [:]
     @Published var version: String?
+    @Published var configurationStatus = "Einstellungen noch nicht ausgelesen."
+    @Published var configurationValues: [UInt8: UInt16] = [:]
+    @Published var inspectingConfiguration = false
+    @Published var configurationCompleted = 0
+    private var configurationAttempted = Set<UInt8>()
+    static let configurationRegisters: [UInt8] = [0x7B, 0x7C, 0x7D, 0x7F, 0x73, 0x90, 0x72, 0x74, 0x75, 0x80, 0x81]
+    private var configurationQueue: [UInt8] = []
+    private var requestedConfiguration = false
+    private var lastMeasurementReport = ""
     private let registers: [UInt8] = [0x22, 0x26, 0x3E, 0x47]
     private var registerIndex = 0
     private var requestedRegister: UInt8?
@@ -35,6 +44,11 @@ final class PairingTest: ObservableObject {
         crypto = NinebotSessionCrypto(name: name)
         buffer = []; chunks = []; pendingReplies = []; serial = []; retries = 0
         authenticated = false; readings = [:]; version = nil; registerIndex = 0; requestedRegister = nil
+        configurationValues = [:]; configurationQueue = []; inspectingConfiguration = false
+        configurationCompleted = 0; configurationAttempted = []
+        requestedConfiguration = false
+        configurationStatus = "Einstellungen noch nicht ausgelesen."
+        lastMeasurementReport = ""
         nonce = [UInt8](repeating: 0, count: 16)
         let randomResult = nonce.withUnsafeMutableBytes {
             SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!)
@@ -43,7 +57,7 @@ final class PairingTest: ObservableObject {
         active = true
         stage = "subscribe"
         status = "Aktiviere Empfang für die verschlüsselte Anmeldung …"
-        log("Anmeldung 0.5 gestartet. Keine Schlüssel, Seriennummern oder Anmelde-Rohpakete im Bericht.")
+        log("Anmeldung 0.6 gestartet. Keine Schlüssel, Seriennummern oder Anmelde-Rohpakete im Bericht.")
         later(8) { [weak self] in self?.finish("Keine Bestätigung des Datenempfangs.") }
         if tx.isNotifying { subscribed(error: nil) }
         else { peripheral.setNotifyValue(true, for: tx) }
@@ -146,7 +160,12 @@ final class PairingTest: ObservableObject {
                   plain[6] == requestedRegister, plain[2] == 2, plain.count == 9 {
             let register = plain[6]
             requestedRegister = nil
-            if let reading = TelemetryReading.decode(register: register, low: plain[7], high: plain[8]) {
+            if requestedConfiguration {
+                configurationCompleted += 1
+                let value = UInt16(plain[7]) | UInt16(plain[8]) << 8
+                configurationValues[register] = value
+                logger?(String(format: "Einstellungs-Leseprüfung: Register 0x%02X = 0x%04X (%u); XiaoDash-Bedeutung noch ungeprüft.", register, value, value))
+            } else if let reading = TelemetryReading.decode(register: register, low: plain[7], high: plain[8]) {
                 if readings[register] == nil { logger?("Messwert \(reading.title): \(reading.text) · Standardregister, Zuordnung mit XiaoDash vergleichen.") }
                 readings[register] = reading
                 status = "Angemeldet · Messwerte werden aktualisiert"
@@ -157,21 +176,48 @@ final class PairingTest: ObservableObject {
             later(0.5) { [weak self] in self?.pollNext() }
         }
     }
+    func inspectConfiguration() {
+        guard authenticated, active, !inspectingConfiguration else { return }
+        configurationValues = [:]
+        configurationCompleted = 0; configurationAttempted = []
+        // Only documented configuration addresses; do not read identity/key registers.
+        configurationQueue = Self.configurationRegisters
+        inspectingConfiguration = true
+        configurationStatus = "Dokumentierte Einstellungen werden gelesen …"
+        logger?("Einstellungsprüfung gestartet: nur CMD 01, elf dokumentierte Standardregister (ES/G30; XiaoDash-Zuordnung ungeprüft). Keine Änderungen.")
+    }
     private func pollNext() {
         guard active, stage == "telemetry", requestedRegister == nil else { return }
         if !chunks.isEmpty {
             later(0.2) { [weak self] in self?.pollNext() }
             return
         }
-        let register = registers[registerIndex]
-        registerIndex = (registerIndex + 1) % registers.count
+        if inspectingConfiguration, configurationQueue.isEmpty {
+            inspectingConfiguration = false
+            configurationStatus = "Leseprüfung beendet · \(configurationValues.count) von \(Self.configurationRegisters.count) Antworten. XiaoDash-Zuordnung ungeprüft."
+            logger?(configurationStatus)
+        }
+        // Alternate settings reads with live measurements to keep the display current.
+        let readConfiguration = inspectingConfiguration && !requestedConfiguration
+        let register: UInt8
+        if readConfiguration {
+            register = configurationQueue.removeFirst()
+            configurationAttempted.insert(register)
+            configurationStatus = "Leseprüfung \(configurationCompleted + 1)/\(Self.configurationRegisters.count) · bitte App geöffnet lassen"
+        }
+        else {
+            register = registers[registerIndex]
+            registerIndex = (registerIndex + 1) % registers.count
+        }
+        requestedConfiguration = readConfiguration
         requestedRegister = register
         later(5) { [weak self] in
             guard let self = self, self.active, self.stage == "telemetry", self.requestedRegister == register else { return }
             // A missing write acknowledgement must not leave the sender retrying forever.
             if !self.chunks.isEmpty { self.finish("Bluetooth-Übertragung ohne Bestätigung; bitte neu verbinden."); return }
             self.requestedRegister = nil
-            self.readings.removeValue(forKey: register)
+            if self.requestedConfiguration { self.configurationCompleted += 1 }
+            else { self.readings.removeValue(forKey: register) }
             self.status = String(format: "Keine Antwort für Register 0x%02X · weitere Messwerte werden geprüft", register)
             self.logger?(self.status)
             self.later(0.5) { [weak self] in self?.pollNext() }
@@ -182,7 +228,14 @@ final class PairingTest: ObservableObject {
         let values = registers.compactMap { readings[$0] }.map {
             "\($0.title): \($0.text) · Alter \(Int(max(0, Date().timeIntervalSince($0.timestamp)))) s"
         }
-        return (["Messwerte (Standardregister; Zuordnung noch zu prüfen):"] + values).joined(separator: "\n")
+        let measurements = values.isEmpty ? lastMeasurementReport : (["Messwerte:"] + values).joined(separator: "\n")
+        let settings = configurationValues.keys.sorted().map {
+            String(format: "Standardregister 0x%02X: 0x%04X · Bedeutung unter XiaoDash ungeprüft", $0, configurationValues[$0]!)
+        }
+        let missing = configurationAttempted.subtracting(configurationValues.keys).sorted().map {
+            String(format: "Standardregister 0x%02X: keine bestätigte Antwort", $0)
+        }
+        return ([measurements, configurationStatus] + settings + missing).joined(separator: "\n")
     }
     private func buttonTick() {
         guard active, stage == "button" else { return }
@@ -208,9 +261,16 @@ final class PairingTest: ObservableObject {
     }
     private func finish(_ message: String) {
         timer?.cancel()
+        if !readings.isEmpty {
+            lastMeasurementReport = (["Letzte Messwerte vor Sitzungsende (nicht mehr live):"] + registers.compactMap { readings[$0] }.map { "\($0.title): \($0.text)" }).joined(separator: "\n")
+        }
         active = false
         authenticated = false
         readings = [:]; requestedRegister = nil
+        if inspectingConfiguration {
+            configurationStatus = "Leseprüfung unterbrochen · \(configurationCompleted)/\(Self.configurationRegisters.count) abgeschlossen."
+        }
+        configurationQueue = []; inspectingConfiguration = false
         stage = "idle"
         chunks = []; pendingReplies = []; buffer = []; nonce = []; serial = []; crypto = nil
         status = message
@@ -219,4 +279,5 @@ final class PairingTest: ObservableObject {
         peripheral = nil; tx = nil; rx = nil; logger = nil
     }
 }
+
 
