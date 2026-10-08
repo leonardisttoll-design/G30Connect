@@ -1,5 +1,6 @@
 import SwiftUI
 import CoreBluetooth
+import Combine
 
 @main
 struct G30ConnectApp: App {
@@ -21,8 +22,10 @@ struct ServiceInfo: Identifiable {
     var characteristics: [String]
 }
 
-// All CoreBluetooth callbacks run on the main queue. No scooter commands are sent.
+// CoreBluetooth and pairing callbacks run on the main queue.
 final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
+    let pairing = PairingTest()
+    private var pairingObservation: AnyCancellable?
     @Published var status = "Bluetooth wird vorbereitet …"
     @Published var ready = false
     @Published var scanning = false
@@ -55,6 +58,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
 
     override init() {
         super.init()
+        pairingObservation = pairing.objectWillChange.sink { [weak self] in self?.objectWillChange.send() }
         central = CBCentralManager(delegate: self, queue: .main)
     }
 
@@ -98,7 +102,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         log = []
         scanning = true
         status = "Suche läuft für 15 Sekunden …"
-        record("G30 Connect 0.3 · Empfang und einzelne Legacy-Leseabfrage")
+        record("G30 Connect 0.4 · Anmeldetest mit Tastenbestätigung")
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
@@ -253,6 +257,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     private func resetReceiver() {
+        pairing.reset()
         queryTimeout?.cancel()
         queryPending = false
         querySent = false
@@ -269,7 +274,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     func startReceiveTest() {
-        guard !queryPending else { return }
+        guard !queryPending, !pairing.active else { return }
         guard connected, !receiving, let peripheral = selected,
               let characteristic = receiveCharacteristic else { return }
         receiveTimeout?.cancel()
@@ -304,6 +309,10 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
         guard selected === peripheral, characteristic === receiveCharacteristic else { return }
+        if pairing.active {
+            if characteristic.isNotifying || error != nil { pairing.subscribed(error: error) }
+            return
+        }
         if let error = error {
             queryTimeout?.cancel()
             queryPending = false
@@ -323,6 +332,10 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if selected === peripheral, characteristic === receiveCharacteristic, pairing.active {
+            if let data = characteristic.value, error == nil { pairing.received(data) }
+            return
+        }
         guard selected === peripheral, characteristic === receiveCharacteristic, receiving else { return }
         if let error = error { record("Empfangsfehler: \(error.localizedDescription)"); return }
         guard let data = characteristic.value else { return }
@@ -339,7 +352,12 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         }
     }
 
-    var canQuery: Bool { connected && receiverReady && writeCharacteristic != nil && !receiving && !queryPending }
+    var canQuery: Bool { connected && receiverReady && writeCharacteristic != nil && !receiving && !queryPending && !pairing.active }
+
+    func startPairing() {
+        guard canQuery, let peripheral = selected, let tx = receiveCharacteristic, let rx = writeCharacteristic else { return }
+        pairing.start(peripheral: peripheral, tx: tx, rx: rx, name: deviceName) { [weak self] message in self?.record(message) }
+    }
 
     func startVersionQuery() {
         guard canQuery, let peripheral = selected, let tx = receiveCharacteristic else { return }
@@ -381,6 +399,10 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        if selected === peripheral, characteristic === writeCharacteristic, pairing.active {
+            pairing.wrote(error: error)
+            return
+        }
         guard selected === peripheral, characteristic === writeCharacteristic, queryPending else { return }
         if let error = error {
             queryPending = false
@@ -433,7 +455,7 @@ struct ContentView: View {
                     Label("G30 CONNECT", systemImage: "scooter")
                         .font(.title2.bold()).foregroundStyle(.mint)
                     Text("Dein Scooter. Deine Verbindung.").font(.headline)
-                    Text("Version 0.3 · Protokolltest").foregroundStyle(.secondary)
+                    Text("Version 0.4 · Anmeldung mit Taste").foregroundStyle(.secondary)
                     Text(model.status).accessibilityIdentifier("connectionStatus")
                     if model.scanning || model.busy { ProgressView() }
                     Button(model.scanning ? "Erneut suchen" : "Scooter suchen") { model.scan() }
@@ -441,6 +463,19 @@ struct ContentView: View {
                         .disabled(!model.ready || model.busy || model.connected)
                     if model.connected || model.busy {
                         Button("Verbindung trennen", role: .destructive) { model.disconnect() }
+                    }
+                }
+                Section("Beim Scooter anmelden") {
+                    Text(model.pairing.status).font(.headline)
+                    Text("Die App versucht die verschlüsselte Ninebot-Anmeldung. Drücke die Ein-/Lichttaste erst kurz, wenn die App dich dazu auffordert. Dabei wird ein neuer Kommunikationsschlüssel ausgehandelt; andere Apps müssen sich gegebenenfalls erneut anmelden. Unterstützung von BLE 1.1.7 und XiaoDash ist noch ungeprüft.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                    if model.pairing.active {
+                        ProgressView()
+                        Button("Anmeldetest abbrechen") { model.pairing.cancel() }
+                    } else {
+                        Button("Anmeldung mit Taste testen") { model.startPairing() }
+                            .buttonStyle(.borderedProminent).tint(.mint)
+                            .disabled(!model.canQuery)
                     }
                 }
                 Section("Datenempfang") {
@@ -451,7 +486,7 @@ struct ContentView: View {
                         Button("Empfangstest beenden") { model.stopReceiveTest() }
                     } else {
                         Button("Datenempfang testen (20 Sekunden)") { model.startReceiveTest() }
-                            .disabled(!model.connected || !model.receiverReady)
+                            .disabled(!model.connected || !model.receiverReady || model.pairing.active)
                     }
                     Text("Empfangene Pakete: \(model.packetCount)").font(.caption)
                 }
