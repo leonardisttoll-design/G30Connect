@@ -6,6 +6,12 @@ import Combine
 
 final class PairingTest: ObservableObject {
     @Published var active = false
+    @Published var authenticated = false
+    @Published var readings: [UInt8: TelemetryReading] = [:]
+    @Published var version: String?
+    private let registers: [UInt8] = [0x22, 0x26, 0x3E, 0x47]
+    private var registerIndex = 0
+    private var requestedRegister: UInt8?
     @Published var status = "Anmeldung noch nicht getestet."
     private var crypto: NinebotSessionCrypto?
     private var peripheral: CBPeripheral?
@@ -28,6 +34,7 @@ final class PairingTest: ObservableObject {
         self.peripheral = peripheral; self.tx = tx; self.rx = rx; logger = log
         crypto = NinebotSessionCrypto(name: name)
         buffer = []; chunks = []; pendingReplies = []; serial = []; retries = 0
+        authenticated = false; readings = [:]; version = nil; registerIndex = 0; requestedRegister = nil
         nonce = [UInt8](repeating: 0, count: 16)
         let randomResult = nonce.withUnsafeMutableBytes {
             SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!)
@@ -36,7 +43,7 @@ final class PairingTest: ObservableObject {
         active = true
         stage = "subscribe"
         status = "Aktiviere Empfang für die verschlüsselte Anmeldung …"
-        log("Anmeldetest 0.4 gestartet. Keine Schlüssel, Seriennummern oder Anmelde-Rohpakete im Bericht.")
+        log("Anmeldung 0.5 gestartet. Keine Schlüssel, Seriennummern oder Anmelde-Rohpakete im Bericht.")
         later(8) { [weak self] in self?.finish("Keine Bestätigung des Datenempfangs.") }
         if tx.isNotifying { subscribed(error: nil) }
         else { peripheral.setNotifyValue(true, for: tx) }
@@ -128,8 +135,54 @@ final class PairingTest: ObservableObject {
             send(command: 1, destination: 0x20, argument: 0x1A, payload: [2])
         } else if stage == "version", plain[3] == 0x20, command == 4, plain[6] == 0x1A, plain[2] == 2, plain.count == 9 {
             let value = UInt16(plain[7]) | UInt16(plain[8]) << 8
-            finish(String(format: "Anmeldung und verschlüsselte Abfrage erfolgreich · Versionsregister 0x%04X (Override möglich).", value))
+            version = String(format: "0x%04X", value)
+            logger?("Anmeldung und verschlüsselte Versionsabfrage erfolgreich · \(version!) (Override möglich).")
+            authenticated = true
+            stage = "telemetry"
+            nonce = []; serial = []
+            status = "Angemeldet · lese Messwerte …"
+            pollNext()
+        } else if stage == "telemetry", plain[3] == 0x20, command == 4,
+                  plain[6] == requestedRegister, plain[2] == 2, plain.count == 9 {
+            let register = plain[6]
+            requestedRegister = nil
+            if let reading = TelemetryReading.decode(register: register, low: plain[7], high: plain[8]) {
+                if readings[register] == nil { logger?("Messwert \(reading.title): \(reading.text) · Standardregister, Zuordnung mit XiaoDash vergleichen.") }
+                readings[register] = reading
+                status = "Angemeldet · Messwerte werden aktualisiert"
+            } else {
+                readings.removeValue(forKey: register)
+                logger?(String(format: "Register 0x%02X: unplausibler Wert 0x%02X%02X; nicht angezeigt.", register, plain[8], plain[7]))
+            }
+            later(0.5) { [weak self] in self?.pollNext() }
         }
+    }
+    private func pollNext() {
+        guard active, stage == "telemetry", requestedRegister == nil else { return }
+        if !chunks.isEmpty {
+            later(0.2) { [weak self] in self?.pollNext() }
+            return
+        }
+        let register = registers[registerIndex]
+        registerIndex = (registerIndex + 1) % registers.count
+        requestedRegister = register
+        later(5) { [weak self] in
+            guard let self = self, self.active, self.stage == "telemetry", self.requestedRegister == register else { return }
+            // A missing write acknowledgement must not leave the sender retrying forever.
+            if !self.chunks.isEmpty { self.finish("Bluetooth-Übertragung ohne Bestätigung; bitte neu verbinden."); return }
+            self.requestedRegister = nil
+            self.readings.removeValue(forKey: register)
+            self.status = String(format: "Keine Antwort für Register 0x%02X · weitere Messwerte werden geprüft", register)
+            self.logger?(self.status)
+            self.later(0.5) { [weak self] in self?.pollNext() }
+        }
+        send(command: 1, destination: 0x20, argument: register, payload: [2])
+    }
+    var report: String {
+        let values = registers.compactMap { readings[$0] }.map {
+            "\($0.title): \($0.text) · Alter \(Int(max(0, Date().timeIntervalSince($0.timestamp)))) s"
+        }
+        return (["Messwerte (Standardregister; Zuordnung noch zu prüfen):"] + values).joined(separator: "\n")
     }
     private func buttonTick() {
         guard active, stage == "button" else { return }
@@ -147,7 +200,7 @@ final class PairingTest: ObservableObject {
         if active { later(2) { [weak self] in self?.authTick() } }
     }
     func cancel() {
-        if active { finish("Anmeldetest beendet.") }
+        if active { finish("Datenabfrage beendet.") }
     }
     func reset() {
         cancel()
@@ -156,6 +209,8 @@ final class PairingTest: ObservableObject {
     private func finish(_ message: String) {
         timer?.cancel()
         active = false
+        authenticated = false
+        readings = [:]; requestedRegister = nil
         stage = "idle"
         chunks = []; pendingReplies = []; buffer = []; nonce = []; serial = []; crypto = nil
         status = message

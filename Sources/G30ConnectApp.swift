@@ -102,7 +102,7 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         log = []
         scanning = true
         status = "Suche läuft für 15 Sekunden …"
-        record("G30 Connect 0.4 · Anmeldetest mit Tastenbestätigung")
+        record("G30 Connect 0.5 · Verschlüsselte Messwertabfragen")
         central.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
@@ -443,11 +443,12 @@ final class BluetoothModel: NSObject, ObservableObject, CBCentralManagerDelegate
         }
     }
 
-    var report: String { log.joined(separator: "\n") }
+    var report: String { log.joined(separator: "\n") + "\n\n" + pairing.report }
 }
 
 struct ContentView: View {
     @ObservedObject var model: BluetoothModel
+    @Environment(\.scenePhase) private var scenePhase
     var body: some View {
         NavigationStack {
             List {
@@ -455,7 +456,7 @@ struct ContentView: View {
                     Label("G30 CONNECT", systemImage: "scooter")
                         .font(.title2.bold()).foregroundStyle(.mint)
                     Text("Dein Scooter. Deine Verbindung.").font(.headline)
-                    Text("Version 0.4 · Anmeldung mit Taste").foregroundStyle(.secondary)
+                    Text("Version 0.5 · Anmeldung und Messwerte").foregroundStyle(.secondary)
                     Text(model.status).accessibilityIdentifier("connectionStatus")
                     if model.scanning || model.busy { ProgressView() }
                     Button(model.scanning ? "Erneut suchen" : "Scooter suchen") { model.scan() }
@@ -465,37 +466,39 @@ struct ContentView: View {
                         Button("Verbindung trennen", role: .destructive) { model.disconnect() }
                     }
                 }
-                Section("Beim Scooter anmelden") {
+                Section("Anmeldung und Messwerte") {
                     Text(model.pairing.status).font(.headline)
-                    Text("Die App versucht die verschlüsselte Ninebot-Anmeldung. Drücke die Ein-/Lichttaste erst kurz, wenn die App dich dazu auffordert. Dabei wird ein neuer Kommunikationsschlüssel ausgehandelt; andere Apps müssen sich gegebenenfalls erneut anmelden. Unterstützung von BLE 1.1.7 und XiaoDash ist noch ungeprüft.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    if model.pairing.active {
-                        ProgressView()
-                        Button("Anmeldetest abbrechen") { model.pairing.cancel() }
+                    if model.pairing.authenticated {
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            ForEach([UInt8(0x22), 0x26, 0x3E, 0x47], id: \.self) { register in
+                                let reading = model.pairing.readings[register]
+                                let titles: [UInt8: String] = [0x22: "Akku", 0x26: "Geschwindigkeit", 0x3E: "Controller-Temperatur", 0x47: "Spannung"]
+                                HStack {
+                                    Text(titles[register] ?? "Messwert")
+                                    Spacer()
+                                    if let reading = reading, context.date.timeIntervalSince(reading.timestamp) <= 10 {
+                                        Text(reading.text).monospacedDigit().foregroundStyle(.mint)
+                                    } else { Text("—").foregroundStyle(.secondary) }
+                                }
+                            }
+                        }
+                        if let version = model.pairing.version {
+                            Text("Versionsregister: \(version) · kann überschrieben sein").font(.caption)
+                        }
+                        Text("Messwerte aus Standardregistern. Bitte Akku, Temperatur und Spannung beim ersten Test im Stand mit XiaoDash vergleichen. Werte ohne aktuelle Antwort erscheinen als —.")
+                            .font(.footnote).foregroundStyle(.secondary)
                     } else {
-                        Button("Anmeldung mit Taste testen") { model.startPairing() }
+                        Text("Drücke die Ein-/Lichttaste einmal kurz, sobald die App dich dazu auffordert. Danach liest sie die Messwerte automatisch.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    if model.pairing.active {
+                        if !model.pairing.authenticated { ProgressView() }
+                        Button("Datenabfrage beenden") { model.pairing.cancel() }
+                    } else {
+                        Button("Anmelden und Daten lesen") { model.startPairing() }
                             .buttonStyle(.borderedProminent).tint(.mint)
                             .disabled(!model.canQuery)
                     }
-                }
-                Section("Datenempfang") {
-                    Text(model.receiveStatus)
-                    Text("Der Test aktiviert für 20 Sekunden den Empfang von Bluetooth-Benachrichtigungen. Er prüft, ob der Scooter von selbst Daten sendet. Geschwindigkeit und Akkustand werden noch nicht entschlüsselt.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    if model.receiving {
-                        Button("Empfangstest beenden") { model.stopReceiveTest() }
-                    } else {
-                        Button("Datenempfang testen (20 Sekunden)") { model.startReceiveTest() }
-                            .disabled(!model.connected || !model.receiverReady || model.pairing.active)
-                    }
-                    Text("Empfangene Pakete: \(model.packetCount)").font(.caption)
-                }
-                Section("Aktive Versionsabfrage") {
-                    Text(model.queryStatus)
-                    Text("Sendet einmal den dokumentierten Ninebot-Lesebefehl für das Versionsregister. Ob deine XiaoDash-Firmware dieses ältere, unverschlüsselte Protokoll akzeptiert, ist noch offen. Test im Stand durchführen.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    Button("Versionsregister abfragen") { model.startVersionQuery() }
-                        .disabled(!model.canQuery)
                 }
                 Section("Bluetooth-Geräte") {
                     if model.devices.isEmpty {
@@ -528,7 +531,7 @@ struct ContentView: View {
                     }
                 }
                 Section("Diagnose teilen") {
-                    Text("Teile den Bericht hier im Chat, damit wir die nächste Version anpassen können. Empfangene Rohdaten können Geräteinformationen enthalten. Prüfe den Text vor dem Teilen und lade ihn nicht ins öffentliche GitHub-Repository.")
+                    Text("Teile den Bericht hier im Chat, damit wir die nächste Version anpassen können. Der Bericht enthält Anmeldestatus und Messwerte; keine Schlüssel oder Anmelde-Rohpakete.")
                         .font(.footnote).foregroundStyle(.secondary)
                     ShareLink(item: model.report) { Label("Bericht teilen", systemImage: "square.and.arrow.up") }
                         .disabled(model.log.isEmpty)
@@ -537,6 +540,11 @@ struct ContentView: View {
             }
             .navigationTitle("G30 Connect")
             .preferredColorScheme(.dark)
+            .onChange(of: scenePhase) { phase in
+                if phase == .background { model.disconnect() }
+            }
         }
     }
 }
+
+
