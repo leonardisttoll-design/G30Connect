@@ -9,6 +9,11 @@ final class PairingTest: ObservableObject {
     @Published var authenticated = false
     @Published var readings: [UInt8: TelemetryReading] = [:]
     @Published var version: String?
+    @Published var rideMode: RideMode?
+    @Published var modeChangeBusy = false
+    @Published var modeChangeStatus = "Fahrmodus noch nicht geändert."
+    private var modeChange: ModeChangeTransaction?
+    private var modeSpeedTime: Date?
     @Published var configurationStatus = "Einstellungen noch nicht ausgelesen."
     @Published var configurationValues: [UInt8: UInt16] = [:]
     @Published var inspectingConfiguration = false
@@ -18,7 +23,7 @@ final class PairingTest: ObservableObject {
     private var configurationQueue: [UInt8] = []
     private var requestedConfiguration = false
     private var lastMeasurementReport = ""
-    private let registers: [UInt8] = [0x22, 0x26, 0x3E, 0x47]
+    private let registers: [UInt8] = [0x22, 0x26, 0x3E, 0x47, 0x75]
     private var registerIndex = 0
     private var requestedRegister: UInt8?
     @Published var status = "Anmeldung noch nicht getestet."
@@ -47,6 +52,8 @@ final class PairingTest: ObservableObject {
         configurationValues = [:]; configurationQueue = []; inspectingConfiguration = false
         configurationCompleted = 0; configurationAttempted = []
         requestedConfiguration = false
+        rideMode = nil; modeChange = nil; modeChangeBusy = false; modeSpeedTime = nil
+        modeChangeStatus = "Fahrmodus noch nicht geändert."
         configurationStatus = "Einstellungen noch nicht ausgelesen."
         lastMeasurementReport = ""
         nonce = [UInt8](repeating: 0, count: 16)
@@ -57,7 +64,7 @@ final class PairingTest: ObservableObject {
         active = true
         stage = "subscribe"
         status = "Aktiviere Empfang für die verschlüsselte Anmeldung …"
-        log("Anmeldung 0.6 gestartet. Keine Schlüssel, Seriennummern oder Anmelde-Rohpakete im Bericht.")
+        log("Anmeldung 0.7 gestartet. Keine Schlüssel, Seriennummern oder Anmelde-Rohpakete im Bericht.")
         later(8) { [weak self] in self?.finish("Keine Bestätigung des Datenempfangs.") }
         if tx.isNotifying { subscribed(error: nil) }
         else { peripheral.setNotifyValue(true, for: tx) }
@@ -98,6 +105,10 @@ final class PairingTest: ObservableObject {
             let replies = pendingReplies
             pendingReplies = []
             for reply in replies where active { handle(reply) }
+            if active, modeChange?.phase == .awaitingWrite {
+                modeChange?.transmissionCompleted()
+                later(0.2) { [weak self] in self?.pollNext() }
+            }
         }
     }
     func received(_ data: Data) {
@@ -124,6 +135,11 @@ final class PairingTest: ObservableObject {
     private func handle(_ plain: [UInt8]) {
         guard plain.count >= 7 else { return }
         let command = plain[5]
+        if stage == "telemetry", modeChangeBusy, plain[3] == 0x20, command == 5,
+           modeChange?.phase == .awaitingWrite || modeChange?.phase == .verify {
+            logger?(String(format: "Schreibantwort CMD 05: Index 0x%02X, Datenlänge %u. Ergebnis erst nach Rücklesen bestätigt.", plain[6], plain[2]))
+            return
+        }
         if stage == "hello", plain[3] == 0x21, command == 0x5B, plain[2] == 30, plain.count == 37 {
             serial = Array(plain[23..<37])
             guard serial.allSatisfy({ $0 >= 0x20 && $0 <= 0x7E }) else {
@@ -160,11 +176,21 @@ final class PairingTest: ObservableObject {
                   plain[6] == requestedRegister, plain[2] == 2, plain.count == 9 {
             let register = plain[6]
             requestedRegister = nil
+            let rawValue = UInt16(plain[7]) | UInt16(plain[8]) << 8
+            if modeChangeBusy, modeChange?.readRegister == register {
+                if register == 0x26 { modeSpeedTime = Date() }
+                if register == 0x75 { rideMode = RideMode(rawValue: rawValue) }
+                modeChange?.accept(register: register, value: rawValue)
+                later(0.2) { [weak self] in self?.pollNext() }
+                return
+            }
             if requestedConfiguration {
                 configurationCompleted += 1
                 let value = UInt16(plain[7]) | UInt16(plain[8]) << 8
                 configurationValues[register] = value
                 logger?(String(format: "Einstellungs-Leseprüfung: Register 0x%02X = 0x%04X (%u); XiaoDash-Bedeutung noch ungeprüft.", register, value, value))
+            } else if register == 0x75 {
+                rideMode = RideMode(rawValue: rawValue)
             } else if let reading = TelemetryReading.decode(register: register, low: plain[7], high: plain[8]) {
                 if readings[register] == nil { logger?("Messwert \(reading.title): \(reading.text) · Standardregister, Zuordnung mit XiaoDash vergleichen.") }
                 readings[register] = reading
@@ -177,7 +203,7 @@ final class PairingTest: ObservableObject {
         }
     }
     func inspectConfiguration() {
-        guard authenticated, active, !inspectingConfiguration else { return }
+        guard authenticated, active, !inspectingConfiguration, !modeChangeBusy else { return }
         configurationValues = [:]
         configurationCompleted = 0; configurationAttempted = []
         // Only documented configuration addresses; do not read identity/key registers.
@@ -192,6 +218,7 @@ final class PairingTest: ObservableObject {
             later(0.2) { [weak self] in self?.pollNext() }
             return
         }
+        if modeChangeBusy { advanceModeChange(); return }
         if inspectingConfiguration, configurationQueue.isEmpty {
             inspectingConfiguration = false
             configurationStatus = "Leseprüfung beendet · \(configurationValues.count) von \(Self.configurationRegisters.count) Antworten. XiaoDash-Zuordnung ungeprüft."
@@ -217,12 +244,63 @@ final class PairingTest: ObservableObject {
             if !self.chunks.isEmpty { self.finish("Bluetooth-Übertragung ohne Bestätigung; bitte neu verbinden."); return }
             self.requestedRegister = nil
             if self.requestedConfiguration { self.configurationCompleted += 1 }
+            else if register == 0x75 { self.rideMode = nil }
             else { self.readings.removeValue(forKey: register) }
             self.status = String(format: "Keine Antwort für Register 0x%02X · weitere Messwerte werden geprüft", register)
             self.logger?(self.status)
             self.later(0.5) { [weak self] in self?.pollNext() }
         }
         send(command: 1, destination: 0x20, argument: register, payload: [2])
+    }
+    var canChangeMode: Bool {
+        guard authenticated, active, !inspectingConfiguration, !modeChangeBusy,
+              let speed = readings[0x26] else { return false }
+        return abs(speed.value) <= 0.1 && Date().timeIntervalSince(speed.timestamp) < 5
+    }
+    func changeMode(_ mode: RideMode) {
+        guard canChangeMode else { return }
+        modeChange = ModeChangeTransaction(target: mode)
+        modeSpeedTime = nil
+        modeChangeBusy = true
+        modeChangeStatus = "Prüfe Stillstand und bisherigen Fahrmodus …"
+        logger?("Fahrmoduswechsel angefordert: \(mode.title). Erst frische Geschwindigkeit und Register 0x75 lesen.")
+        // The current telemetry request finishes first; the shared sender stays serialized.
+    }
+    private func advanceModeChange() {
+        guard active, let transaction = modeChange else { return }
+        switch transaction.phase {
+        case .complete, .failed:
+            modeChangeStatus = transaction.result
+            logger?(modeChangeStatus)
+            modeChangeBusy = false; modeChange = nil
+            later(0.2) { [weak self] in self?.pollNext() }
+        case .readyToWrite:
+            guard let checkedAt = modeSpeedTime, Date().timeIntervalSince(checkedAt) < 3 else {
+                modeChange?.fail("Stillstandsmessung zu alt; keine Änderung gesendet.")
+                advanceModeChange(); return
+            }
+            modeChange?.markWriteSent()
+            modeChangeStatus = "Sende \(transaction.target.title) einmal · danach Rückleseprüfung …"
+            logger?("Fahrmodus: ein verschlüsselter CMD 02 an Controller 20, Register 75, Wert \(transaction.target.rawValue).")
+            later(5) { [weak self] in self?.finish("Fahrmodus-Übertragung ohne Bestätigung; Ergebnis unbekannt. Am Display prüfen.") }
+            send(command: 2, destination: 0x20, argument: 0x75, payload: transaction.target.payload)
+        case .awaitingWrite: break
+        case .speed, .current, .verify:
+            guard let register = transaction.readRegister else { return }
+            requestedRegister = register
+            requestedConfiguration = false
+            later(5) { [weak self] in
+                guard let self = self, self.modeChangeBusy else { return }
+                if !self.chunks.isEmpty { self.finish("Fahrmodus-Abfrage ohne Bluetooth-Bestätigung; Ergebnis ungeprüft."); return }
+                self.requestedRegister = nil
+                if transaction.phase == .verify { self.rideMode = nil }
+                self.modeChange?.fail(transaction.phase == .verify
+                    ? "Keine Rückleseantwort; Ergebnis unbekannt. Am Display prüfen. Keine erneute Änderung gesendet."
+                    : "Keine Antwort vor der Änderung; kein Schreibbefehl gesendet.")
+                self.advanceModeChange()
+            }
+            send(command: 1, destination: 0x20, argument: register, payload: [2])
+        }
     }
     var report: String {
         let values = registers.compactMap { readings[$0] }.map {
@@ -235,7 +313,7 @@ final class PairingTest: ObservableObject {
         let missing = configurationAttempted.subtracting(configurationValues.keys).sorted().map {
             String(format: "Standardregister 0x%02X: keine bestätigte Antwort", $0)
         }
-        return ([measurements, configurationStatus] + settings + missing).joined(separator: "\n")
+        return ([measurements, "Fahrmodus: \(rideMode?.title ?? "nicht aktuell bekannt")", modeChangeStatus, configurationStatus] + settings + missing).joined(separator: "\n")
     }
     private func buttonTick() {
         guard active, stage == "button" else { return }
@@ -265,6 +343,8 @@ final class PairingTest: ObservableObject {
             lastMeasurementReport = (["Letzte Messwerte vor Sitzungsende (nicht mehr live):"] + registers.compactMap { readings[$0] }.map { "\($0.title): \($0.text)" }).joined(separator: "\n")
         }
         active = false
+        if modeChangeBusy { modeChangeStatus = "Fahrmoduswechsel unterbrochen; Ergebnis am Display prüfen." }
+        modeChange = nil; modeChangeBusy = false; rideMode = nil; modeSpeedTime = nil
         authenticated = false
         readings = [:]; requestedRegister = nil
         if inspectingConfiguration {
