@@ -135,7 +135,7 @@ final class TrackerViewController: UIViewController, WKScriptMessageHandler, WKN
 
     private func send(_ payload: [String: Any]) {
         webView.callAsyncJavaScript("window.__duoNativeReceive && window.__duoNativeReceive(message)",
-            arguments: ["message": payload], in: nil, contentWorld: .page, completionHandler: nil)
+            arguments: ["message": payload], in: nil, in: .page, completionHandler: nil)
     }
 
     private func reply(_ id: String, status: Int = 200, data: [String: Any]) {
