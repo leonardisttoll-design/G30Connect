@@ -33,7 +33,7 @@ jobs:
           cp -R build/Build/Products/Release-iphoneos/DuolingoSpartracker.app package/Payload/
           test -f package/Payload/DuolingoSpartracker.app/DuolingoSpartracker
           test -f package/Payload/DuolingoSpartracker.app/Web/index.html
-          lipo -verify_arch arm64 package/Payload/DuolingoSpartracker.app/DuolingoSpartracker
+          lipo package/Payload/DuolingoSpartracker.app/DuolingoSpartracker -verify_arch arm64
           plutil -lint package/Payload/DuolingoSpartracker.app/Info.plist
           cd package
           zip -qr ../Duolingo-Spartracker.ipa Payload
