@@ -1,0 +1,1 @@
+Native shell build, isolated from the existing main branch. Personal dashboard assets are inserted locally before installation.
