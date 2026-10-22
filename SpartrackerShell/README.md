@@ -1,0 +1,1 @@
+Native iOS shell with local WebKit resources. No user records or personal dashboard settings are included. Build on this separate branch; the existing application on main is unchanged. The final local Web resources are added to the unsigned IPA before AltStore signing.

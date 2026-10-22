@@ -1,0 +1,42 @@
+name: DuolingoSpartracker
+options:
+  deploymentTarget:
+    iOS: '16.0'
+settings:
+  base:
+    SWIFT_VERSION: '5.0'
+    TARGETED_DEVICE_FAMILY: '1'
+    PRODUCT_BUNDLE_IDENTIFIER: de.spartracker.ios
+    MARKETING_VERSION: '1.0.0'
+    CURRENT_PROJECT_VERSION: '1'
+targets:
+  DuolingoSpartracker:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - path: Resources/Web
+        type: folder
+        buildPhase: resources
+      - path: Resources/Assets.xcassets
+        buildPhase: resources
+    info:
+      path: Generated/Info.plist
+      properties:
+        CFBundleDisplayName: Duolingo Spartracker
+        CFBundleShortVersionString: '1.0.0'
+        CFBundleVersion: '1'
+        UILaunchScreen: {}
+        UIUserInterfaceStyle: Light
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        LSSupportsOpeningDocumentsInPlace: true
+    settings:
+      base:
+        CODE_SIGNING_ALLOWED: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+schemes:
+  DuolingoSpartracker:
+    build:
+      targets:
+        DuolingoSpartracker: all

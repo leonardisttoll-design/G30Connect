@@ -1,0 +1,45 @@
+name: Duolingo iPhone-App bauen
+on:
+  workflow_dispatch:
+  push:
+    branches: [duolingo-iphone-build]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: SpartrackerShell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Datenverarbeitung prüfen
+        run: |
+          xcrun swiftc Sources/DuolingoClient.swift Sources/TrackerBackupStore.swift Tests/main.swift -o "$RUNNER_TEMP/duolingo-checks"
+          "$RUNNER_TEMP/duolingo-checks"
+      - name: XcodeGen installieren
+        run: brew install xcodegen
+      - name: Xcode-Projekt erzeugen
+        run: xcodegen generate
+      - name: iPhone-App kompilieren
+        run: >-
+          xcodebuild -project DuolingoSpartracker.xcodeproj -scheme DuolingoSpartracker
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
+          -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+      - name: IPA packen und prüfen
+        run: |
+          mkdir -p package/Payload
+          cp -R build/Build/Products/Release-iphoneos/DuolingoSpartracker.app package/Payload/
+          test -f package/Payload/DuolingoSpartracker.app/DuolingoSpartracker
+          test -f package/Payload/DuolingoSpartracker.app/Web/index.html
+          lipo -verify_arch arm64 package/Payload/DuolingoSpartracker.app/DuolingoSpartracker
+          plutil -lint package/Payload/DuolingoSpartracker.app/Info.plist
+          cd package
+          zip -qr ../Duolingo-Spartracker.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Duolingo-Spartracker-AltStore
+          path: SpartrackerShell/Duolingo-Spartracker.ipa
+          if-no-files-found: error
+          retention-days: 7
